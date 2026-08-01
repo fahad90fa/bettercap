@@ -290,42 +290,84 @@ std::string NetworkManager::ArpLookup(IPv4Address ip) {
 
 void NetworkManager::LoadOuiDatabase(const std::string& path) {
     if (oui_loaded_) return;
-    std::string filepath = path.empty() ? "oui.txt" : path;
-    std::ifstream file(filepath);
+
+    std::vector<std::string> candidates;
+    if (!path.empty()) {
+        candidates.push_back(path);
+    } else {
+        // oui.txt first (explicit local override), then the vendor
+        // databases that security distros (Parrot, Kali, ...) ship with
+        // Wireshark by default — usually tens of thousands of entries,
+        // vs. this file's own ~30-entry hardcoded fallback list.
+        candidates = {
+            "oui.txt",
+            "/usr/share/wireshark/manuf",
+            "/usr/local/share/wireshark/manuf",
+            "/etc/manuf",
+        };
+    }
+
+    std::ifstream file;
+    std::string used_path;
+    for (auto& candidate : candidates) {
+        file.open(candidate);
+        if (file.is_open()) { used_path = candidate; break; }
+        file.clear();
+    }
+
     if (!file.is_open()) {
         oui_loaded_ = true;
-        LOG_WARN("OUI database not found at " + filepath +
-                 " - falling back to built-in vendor heuristics");
+        LOG_WARN("No vendor database found (checked oui.txt and Wireshark's manuf file) "
+                 "- vendor names will fall back to a small built-in list");
         return;
     }
 
     std::string line;
+    size_t loaded = 0;
     while (std::getline(file, line)) {
-        if (line.size() < 8) continue;
-        std::string hex_part = line.substr(0, 6);
+        if (line.empty() || line[0] == '#') continue;
+
+        // Formats seen in the wild: "00:00:0C\tCisco\tCisco Systems, Inc"
+        // (Wireshark manuf, colon-separated prefix, tab-separated names)
+        // or "000000\tXerox" (plain hex prefix + tab). Either way, the
+        // prefix is whatever comes before the first tab/comma.
+        size_t field_end = line.find_first_of("\t,");
+        if (field_end == std::string::npos) continue;
+        std::string prefix_field = line.substr(0, field_end);
+        std::string rest = line.substr(field_end + 1);
+
         std::string clean_hex;
-        for (char c : hex_part) {
-            if (isxdigit(c)) clean_hex += c;
+        for (char c : prefix_field) {
+            if (isxdigit(static_cast<unsigned char>(c))) clean_hex += c;
+            if (clean_hex.size() == 6) break;
         }
-        if (clean_hex.size() == 6) {
-            uint32_t oui = 0;
-            sscanf(clean_hex.c_str(), "%x", &oui);
-            size_t tab_pos = line.find('\t');
-            if (tab_pos != std::string::npos) {
-                size_t name_start = line.find_first_not_of("\t (hex)", tab_pos);
-                if (name_start != std::string::npos) {
-                    std::string vendor = line.substr(name_start);
-                    while (!vendor.empty() && (vendor.back() == '\r' || vendor.back() == '\n' || vendor.back() == ' '))
-                        vendor.pop_back();
-                    while (!vendor.empty() && vendor.front() == ' ')
-                        vendor.erase(0, 1);
-                    oui_db_[oui] = vendor;
-                }
-            }
-        }
+        if (clean_hex.size() != 6) continue; // not a 24-bit OUI prefix (e.g. has a /28 mask) — skip
+
+        uint32_t oui = 0;
+        sscanf(clean_hex.c_str(), "%x", &oui);
+
+        // Prefer the long-form vendor name (Wireshark's 2nd tab field)
+        // when present, otherwise use whatever's left on the line.
+        size_t tab2 = rest.find('\t');
+        std::string vendor = (tab2 != std::string::npos) ? rest.substr(tab2 + 1) : rest;
+
+        while (!vendor.empty() && (vendor.back() == '\r' || vendor.back() == '\n' || vendor.back() == ' '))
+            vendor.pop_back();
+        size_t start = vendor.find_first_not_of(' ');
+        vendor = (start == std::string::npos) ? "" : vendor.substr(start);
+        if (vendor.empty()) continue;
+
+        oui_db_[oui] = vendor;
+        loaded++;
     }
+
     oui_loaded_ = true;
-    LOG_INFO("Loaded " + std::to_string(oui_db_.size()) + " OUI entries");
+    if (loaded > 0) {
+        LOG_SUCCESS("Loaded " + std::to_string(loaded) + " vendor entries from " + used_path);
+    } else {
+        LOG_WARN("Vendor database at " + used_path + " had no parseable entries "
+                 "- vendor names will fall back to a small built-in list");
+    }
 }
 
 std::string NetworkManager::LookupVendor(const MacAddress& mac) {

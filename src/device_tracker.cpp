@@ -5,11 +5,20 @@
 #include <iostream>
 #include <iomanip>
 #include <sstream>
+#include <algorithm>
+#include <vector>
+#include <utility>
 
 namespace phantom {
 
 namespace {
 constexpr int kRescanIntervalSeconds = 20;
+// A device not seen for more than 2 sweeps is flagged stale rather than
+// silently shown as if its last-known IP/MAC were still current — this
+// matters most for phones using MAC-randomization, which can rotate to a
+// brand new MAC (and get a new DHCP lease) and otherwise leave a
+// misleadingly "live-looking" ghost entry behind forever.
+constexpr int kStaleAfterSeconds = kRescanIntervalSeconds * 2 + 5;
 }
 
 void DeviceTracker::StartArpScan() {
@@ -72,26 +81,49 @@ void DeviceTracker::PrintTable() const {
         if (session.devices.empty()) {
             oss << "\nno devices discovered yet\n\n";
         } else {
+            std::vector<std::pair<MacAddress, DeviceInfo>> rows(
+                session.devices.begin(), session.devices.end());
+            std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) {
+                return a.second.ip.SortKey() < b.second.ip.SortKey();
+            });
+
+            auto now = std::chrono::system_clock::now();
+            int active_count = 0, stale_count = 0;
+
             oss << "\n" << std::left << std::setfill(' ')
                 << std::setw(17) << "IP"
                 << std::setw(20) << "MAC"
                 << std::setw(22) << "Vendor"
+                << std::setw(10) << "Last seen"
                 << "Flags" << "\n";
-            oss << std::string(70, '-') << "\n";
+            oss << std::string(90, '-') << "\n";
 
-            for (const auto& [mac, dev] : session.devices) {
+            for (const auto& [mac, dev] : rows) {
+                bool never_seen = dev.last_seen.time_since_epoch().count() == 0;
+                auto age_s = never_seen ? 0 : std::chrono::duration_cast<std::chrono::seconds>(
+                    now - dev.last_seen).count();
+                bool stale = never_seen || age_s > kStaleAfterSeconds;
+                stale ? ++stale_count : ++active_count;
+
                 std::string flags;
                 if (dev.is_self) flags += "[self] ";
                 if (dev.is_gateway) flags += "[gateway] ";
                 if (dev.is_target) flags += "[target] ";
+                if (mac.IsLocallyAdministered()) flags += "[random-mac] ";
+                if (stale) flags += never_seen ? "[never confirmed] " : "[stale] ";
+
+                std::string last_seen =
+                    never_seen ? "never" : (age_s < 0 ? "?" : std::to_string(age_s) + "s ago");
 
                 oss << std::left
                     << std::setw(17) << dev.ip.ToString()
                     << std::setw(20) << mac.ToString()
                     << std::setw(22) << (dev.vendor.empty() ? "-" : dev.vendor)
+                    << std::setw(10) << last_seen
                     << flags << "\n";
             }
-            oss << "\n";
+            oss << active_count << " active, " << stale_count
+                << " stale (not seen in " << kStaleAfterSeconds << "s+)\n\n";
         }
     }
 
