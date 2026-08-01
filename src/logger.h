@@ -61,6 +61,7 @@ public:
 
         std::cout << prefix << " " << time_buf << "."
                   << std::setfill('0') << std::setw(3) << ms.count()
+                  << std::setfill(' ')
                   << " " << message << std::endl;
     }
 

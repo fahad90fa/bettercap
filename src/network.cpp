@@ -293,7 +293,9 @@ void NetworkManager::LoadOuiDatabase(const std::string& path) {
     std::string filepath = path.empty() ? "oui.txt" : path;
     std::ifstream file(filepath);
     if (!file.is_open()) {
-        LOG_WARN("OUI database not found at " + filepath + " - vendor lookup disabled");
+        oui_loaded_ = true;
+        LOG_WARN("OUI database not found at " + filepath +
+                 " - falling back to built-in vendor heuristics");
         return;
     }
 

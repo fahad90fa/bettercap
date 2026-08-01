@@ -70,7 +70,7 @@ void DeviceTracker::PrintTable() const {
         return;
     }
 
-    std::cout << "\n" << std::left
+    std::cout << "\n" << std::left << std::setfill(' ')
                << std::setw(17) << "IP"
                << std::setw(20) << "MAC"
                << std::setw(22) << "Vendor"
