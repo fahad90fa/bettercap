@@ -4,6 +4,7 @@
 #include <chrono>
 #include <iostream>
 #include <iomanip>
+#include <sstream>
 
 namespace phantom {
 
@@ -63,33 +64,42 @@ void DeviceTracker::RunSweep() {
 
 void DeviceTracker::PrintTable() const {
     Session& session = Session::Instance();
-    std::lock_guard<std::mutex> lock(session.devices_mtx);
+    std::ostringstream oss;
 
-    if (session.devices.empty()) {
-        std::cout << "\nno devices discovered yet\n" << std::endl;
-        return;
+    {
+        std::lock_guard<std::mutex> lock(session.devices_mtx);
+
+        if (session.devices.empty()) {
+            oss << "\nno devices discovered yet\n\n";
+        } else {
+            oss << "\n" << std::left << std::setfill(' ')
+                << std::setw(17) << "IP"
+                << std::setw(20) << "MAC"
+                << std::setw(22) << "Vendor"
+                << "Flags" << "\n";
+            oss << std::string(70, '-') << "\n";
+
+            for (const auto& [mac, dev] : session.devices) {
+                std::string flags;
+                if (dev.is_self) flags += "[self] ";
+                if (dev.is_gateway) flags += "[gateway] ";
+                if (dev.is_target) flags += "[target] ";
+
+                oss << std::left
+                    << std::setw(17) << dev.ip.ToString()
+                    << std::setw(20) << mac.ToString()
+                    << std::setw(22) << (dev.vendor.empty() ? "-" : dev.vendor)
+                    << flags << "\n";
+            }
+            oss << "\n";
+        }
     }
 
-    std::cout << "\n" << std::left << std::setfill(' ')
-               << std::setw(17) << "IP"
-               << std::setw(20) << "MAC"
-               << std::setw(22) << "Vendor"
-               << "Flags" << "\n";
-    std::cout << std::string(70, '-') << "\n";
-
-    for (const auto& [mac, dev] : session.devices) {
-        std::string flags;
-        if (dev.is_self) flags += "[self] ";
-        if (dev.is_gateway) flags += "[gateway] ";
-        if (dev.is_target) flags += "[target] ";
-
-        std::cout << std::left
-                   << std::setw(17) << dev.ip.ToString()
-                   << std::setw(20) << mac.ToString()
-                   << std::setw(22) << (dev.vendor.empty() ? "-" : dev.vendor)
-                   << flags << "\n";
-    }
-    std::cout << std::endl;
+    // Flush the whole table through Logger's own console lock so a
+    // concurrent LOG_* call from another thread can't splice a line into
+    // the middle of it (PrintTable and Log() used to write std::cout under
+    // two unrelated mutexes).
+    Logger::Instance().WriteRaw(oss.str());
 }
 
 void DeviceTracker::RecordActivity(const ParsedActivity& activity, const MacAddress& mac) {

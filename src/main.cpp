@@ -17,6 +17,8 @@
 #ifndef _WIN32
 #include <poll.h>
 #include <unistd.h>
+#else
+#include <windows.h>
 #endif
 
 using namespace phantom;
@@ -51,8 +53,13 @@ bool StdinLineReady(int timeout_ms) {
     // unconsumed, or getline will correctly see real EOF and we handle that.
     return rc > 0 && (pfd.revents & (POLLIN | POLLHUP | POLLERR));
 #else
-    (void)timeout_ms;
-    return true;
+    // Wait on the console input handle so we honor timeout_ms instead of
+    // blocking forever in getline() when nothing has been typed — without
+    // this, command_thread.join() during shutdown could hang indefinitely.
+    HANDLE h = GetStdHandle(STD_INPUT_HANDLE);
+    if (h == INVALID_HANDLE_VALUE) return true; // can't check, fall back to blocking read
+    DWORD rc = WaitForSingleObject(h, (DWORD)timeout_ms);
+    return rc == WAIT_OBJECT_0;
 #endif
 }
 

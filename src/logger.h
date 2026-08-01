@@ -65,6 +65,14 @@ public:
                   << " " << message << std::endl;
     }
 
+    // Writes pre-formatted, multi-line text to stdout under the same lock
+    // Log() uses, so a multi-statement block (e.g. a device table) can't get
+    // a log line spliced into the middle of it by a concurrent Log() call.
+    void WriteRaw(const std::string& text) {
+        std::lock_guard<std::mutex> lock(mtx_);
+        std::cout << text;
+    }
+
     void LogActivity(const std::string& json_line) {
         if (activity_log_.is_open()) {
             activity_log_ << json_line << std::endl;
