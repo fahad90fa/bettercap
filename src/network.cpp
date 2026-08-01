@@ -25,6 +25,7 @@
 #include <sstream>
 #include <algorithm>
 #include <cstring>
+#include <chrono>
 
 #if defined(__has_include)
 #  if __has_include(<pcap/pcap.h>)
@@ -357,6 +358,109 @@ std::string NetworkManager::LookupVendor(const MacAddress& mac) {
     if (short_oui == 0x9CB6 || short_oui == 0x5A73 || short_oui == 0x843A) return "Realtek";
 
     return "Unknown";
+}
+
+std::vector<std::pair<IPv4Address, MacAddress>> NetworkManager::ScanSubnet(
+        const std::string& interface_name, int timeout_ms) {
+    std::vector<std::pair<IPv4Address, MacAddress>> results;
+#if PHANTOM_HAS_PCAP
+    auto iface = FindInterface(interface_name);
+    if (!iface || iface->ip.empty() || iface->netmask.empty() || iface->mac.empty()) {
+        LOG_ERROR("Cannot scan subnet: interface has no usable IPv4 address");
+        return results;
+    }
+
+    unsigned int ip_o[4], mask_o[4];
+    if (sscanf(iface->ip.c_str(), "%u.%u.%u.%u", &ip_o[0], &ip_o[1], &ip_o[2], &ip_o[3]) != 4 ||
+        sscanf(iface->netmask.c_str(), "%u.%u.%u.%u", &mask_o[0], &mask_o[1], &mask_o[2], &mask_o[3]) != 4) {
+        return results;
+    }
+
+    uint32_t ip_val = (ip_o[0] << 24) | (ip_o[1] << 16) | (ip_o[2] << 8) | ip_o[3];
+    uint32_t mask_val = (mask_o[0] << 24) | (mask_o[1] << 16) | (mask_o[2] << 8) | mask_o[3];
+    uint32_t network_val = ip_val & mask_val;
+    uint32_t broadcast_val = network_val | ~mask_val;
+
+    if (broadcast_val <= network_val + 1 || (broadcast_val - network_val) > 4094) {
+        LOG_WARN("Subnet scan skipped: need a /20 network or smaller");
+        return results;
+    }
+
+    MacAddress local_mac = MacAddress::FromString(iface->mac);
+    IPv4Address local_ip = IPv4Address::FromString(iface->ip);
+
+    char errbuf[PCAP_ERRBUF_SIZE];
+    pcap_t* handle = pcap_open_live(interface_name.c_str(), 65535, 1, 50, errbuf);
+    if (!handle) {
+        LOG_ERROR("Failed to open interface for subnet scan: " + std::string(errbuf));
+        return results;
+    }
+
+    struct bpf_program filter;
+    if (pcap_compile(handle, &filter, "arp", 1, 0) == 0) {
+        pcap_setfilter(handle, &filter);
+        pcap_freecode(&filter);
+    }
+
+    for (uint32_t h = network_val + 1; h < broadcast_val; ++h) {
+        std::string target_ip_str =
+            std::to_string((h >> 24) & 0xFF) + "." + std::to_string((h >> 16) & 0xFF) + "." +
+            std::to_string((h >> 8) & 0xFF) + "." + std::to_string(h & 0xFF);
+        IPv4Address target_ip = IPv4Address::FromString(target_ip_str);
+        if (target_ip.addr == local_ip.addr) continue;
+
+        uint8_t packet[42] = {0};
+        memset(packet, 0xFF, 6);
+        memcpy(packet + 6, local_mac.bytes, 6);
+        packet[12] = 0x08; packet[13] = 0x06;
+        packet[14] = 0x00; packet[15] = 0x01;
+        packet[16] = 0x08; packet[17] = 0x00;
+        packet[18] = 0x06;
+        packet[19] = 0x04;
+        packet[20] = 0x00; packet[21] = 0x01;
+        memcpy(packet + 22, local_mac.bytes, 6);
+        memcpy(packet + 28, &local_ip.addr, 4);
+        memset(packet + 32, 0, 6);
+        memcpy(packet + 38, &target_ip.addr, 4);
+
+        pcap_sendpacket(handle, packet, sizeof(packet));
+    }
+
+    std::map<uint32_t, MacAddress> found;
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+
+    while (std::chrono::steady_clock::now() < deadline) {
+        struct pcap_pkthdr* header;
+        const uint8_t* data;
+        int rc = pcap_next_ex(handle, &header, &data);
+        if (rc <= 0) continue;
+        if (header->caplen < 42) continue;
+        if (data[12] != 0x08 || data[13] != 0x06) continue;
+        if (data[20] != 0x00 || data[21] != 0x02) continue; // ARP reply
+
+        uint32_t reply_ip;
+        memcpy(&reply_ip, data + 28, 4);
+        if (found.find(reply_ip) == found.end()) {
+            MacAddress mac{};
+            memcpy(mac.bytes, data + 22, 6);
+            found[reply_ip] = mac;
+        }
+    }
+
+    pcap_close(handle);
+
+    results.reserve(found.size());
+    for (auto& [ip_addr, mac] : found) {
+        IPv4Address ip{};
+        ip.addr = ip_addr;
+        results.emplace_back(ip, mac);
+    }
+#else
+    (void)interface_name;
+    (void)timeout_ms;
+    LOG_WARN("Subnet scan requested but libpcap is unavailable in this environment");
+#endif
+    return results;
 }
 
 } // namespace phantom

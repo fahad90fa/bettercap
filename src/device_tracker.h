@@ -16,6 +16,7 @@ public:
     void StartArpScan();
     void StopArpScan();
     bool IsScanning() const { return scanning_; }
+    void PrintTable() const;
 
     void RecordActivity(const ParsedActivity& activity, const MacAddress& mac);
     void RecordCredential(const CapturedCredential& cred, const MacAddress& mac);
@@ -24,6 +25,7 @@ public:
 
 private:
     DeviceTracker() = default;
+    void RunSweep();
 
     std::atomic<bool> scanning_{false};
     std::thread scan_thread_;

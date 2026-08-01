@@ -99,6 +99,11 @@ int main(int argc, char** argv) {
                 IPv4Address tip = IPv4Address::FromString(t);
                 MacAddress tmac = NetworkManager::GetMacForIp(iface_name, tip);
                 arp_spoofer.AddTarget(tip, tmac);
+                Session::Instance().UpdateDevice(tmac, [&](DeviceInfo& dev) {
+                    dev.ip = tip;
+                    dev.mac = tmac;
+                    dev.is_target = true;
+                });
             }
             if (arp_spoofer.Start()) {
                 LOG_SUCCESS("ARP spoofing started for " +
@@ -163,7 +168,10 @@ int main(int argc, char** argv) {
     LOG_INFO("Shutting down...");
     session.running = false;
 
-    if (want_scan) tracker.StopArpScan();
+    if (want_scan) {
+        tracker.StopArpScan();
+        tracker.PrintTable();
+    }
     if (proxy.IsRunning()) proxy.Stop();
     if (dns_spoofer.IsRunning()) dns_spoofer.Stop();
     if (arp_spoofer.IsRunning()) arp_spoofer.Stop();

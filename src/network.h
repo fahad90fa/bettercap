@@ -4,6 +4,7 @@
 #include <string>
 #include <optional>
 #include <map>
+#include <utility>
 
 namespace phantom {
 
@@ -34,6 +35,11 @@ public:
 
     static std::string LookupVendor(const MacAddress& mac);
     static void LoadOuiDatabase(const std::string& path = "");
+
+    // ARP-sweeps every host in the interface's local subnet (max /20) and
+    // returns everyone who replied. Blocks for roughly timeout_ms.
+    static std::vector<std::pair<IPv4Address, MacAddress>> ScanSubnet(
+        const std::string& interface_name, int timeout_ms = 3000);
 
 private:
     static std::map<uint32_t, std::string> oui_db_;
