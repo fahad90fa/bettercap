@@ -295,15 +295,22 @@ void NetworkManager::LoadOuiDatabase(const std::string& path) {
     if (!path.empty()) {
         candidates.push_back(path);
     } else {
-        // oui.txt first (explicit local override), then the vendor
-        // databases that security distros (Parrot, Kali, ...) ship with
-        // Wireshark by default — usually tens of thousands of entries,
-        // vs. this file's own ~30-entry hardcoded fallback list.
+        // oui.txt first (explicit local override), then whatever real
+        // vendor database this machine happens to already have installed
+        // — nmap's compact prefix list ships with nmap itself (almost
+        // always present on a pentest distro), Wireshark's manuf needs the
+        // Wireshark package specifically, and Debian's ieee-data package
+        // (a common transitive dependency of tools like arp-scan/ettercap)
+        // installs the raw IEEE registry. Any of these beats this file's
+        // own ~30-entry hardcoded fallback list by orders of magnitude.
         candidates = {
             "oui.txt",
+            "/usr/share/nmap/nmap-mac-prefixes",
             "/usr/share/wireshark/manuf",
             "/usr/local/share/wireshark/manuf",
             "/etc/manuf",
+            "/usr/share/ieee-data/oui.txt",
+            "/var/lib/ieee-data/oui.txt",
         };
     }
 
@@ -317,8 +324,10 @@ void NetworkManager::LoadOuiDatabase(const std::string& path) {
 
     if (!file.is_open()) {
         oui_loaded_ = true;
-        LOG_WARN("No vendor database found (checked oui.txt and Wireshark's manuf file) "
-                 "- vendor names will fall back to a small built-in list");
+        LOG_WARN("No vendor database found (checked oui.txt, nmap-mac-prefixes, Wireshark's "
+                 "manuf, and ieee-data) - vendor names will fall back to a small built-in "
+                 "list. Run: sudo apt install -y wireshark-common (installs just the manuf "
+                 "database, no GUI needed) to get real vendor names.");
         return;
     }
 
@@ -328,10 +337,11 @@ void NetworkManager::LoadOuiDatabase(const std::string& path) {
         if (line.empty() || line[0] == '#') continue;
 
         // Formats seen in the wild: "00:00:0C\tCisco\tCisco Systems, Inc"
-        // (Wireshark manuf, colon-separated prefix, tab-separated names)
+        // (Wireshark manuf, colon-separated prefix, tab-separated names),
+        // "000000 XEROX CORPORATION" (nmap-mac-prefixes, space-separated),
         // or "000000\tXerox" (plain hex prefix + tab). Either way, the
-        // prefix is whatever comes before the first tab/comma.
-        size_t field_end = line.find_first_of("\t,");
+        // prefix is whatever comes before the first tab/comma/space.
+        size_t field_end = line.find_first_of("\t, ");
         if (field_end == std::string::npos) continue;
         std::string prefix_field = line.substr(0, field_end);
         std::string rest = line.substr(field_end + 1);

@@ -126,9 +126,18 @@ void CommandLoop(ArpSpoofer& arp_spoofer, DnsSpoofer& dns_spoofer, MitmProxy& pr
             }
         } else if (cmd == "dns.spoof") {
             if (sub == "on") {
-                if (dns_spoofer.IsRunning()) LOG_WARN("dns.spoof already running");
-                else if (dns_spoofer.Start()) LOG_SUCCESS("dns.spoof started");
-                else LOG_ERROR("dns.spoof failed to start");
+                if (dns_spoofer.IsRunning()) {
+                    LOG_WARN("dns.spoof already running");
+                } else if (dns_spoofer.Start()) {
+                    LOG_SUCCESS("dns.spoof started");
+                    if (!arp_spoofer.IsRunning()) {
+                        LOG_WARN("arp.spoof isn't running — on encrypted Wi-Fi you won't see "
+                                 "any other device's traffic until you also run: "
+                                 "arp.spoof on <target-ip>");
+                    }
+                } else {
+                    LOG_ERROR("dns.spoof failed to start");
+                }
             } else if (sub == "off") {
                 if (!dns_spoofer.IsRunning()) LOG_WARN("dns.spoof not running");
                 else { dns_spoofer.Stop(); LOG_SUCCESS("dns.spoof stopped"); }
@@ -137,9 +146,18 @@ void CommandLoop(ArpSpoofer& arp_spoofer, DnsSpoofer& dns_spoofer, MitmProxy& pr
             }
         } else if (cmd == "https.proxy") {
             if (sub == "on") {
-                if (proxy.IsRunning()) LOG_WARN("https.proxy already running");
-                else if (proxy.Start()) LOG_SUCCESS("https.proxy started on port " + std::to_string(PROXY_PORT));
-                else LOG_ERROR("https.proxy failed to start");
+                if (proxy.IsRunning()) {
+                    LOG_WARN("https.proxy already running");
+                } else if (proxy.Start()) {
+                    LOG_SUCCESS("https.proxy started on port " + std::to_string(PROXY_PORT));
+                    if (!arp_spoofer.IsRunning()) {
+                        LOG_WARN("arp.spoof isn't running — on encrypted Wi-Fi you won't see "
+                                 "any other device's traffic until you also run: "
+                                 "arp.spoof on <target-ip>");
+                    }
+                } else {
+                    LOG_ERROR("https.proxy failed to start");
+                }
             } else if (sub == "off") {
                 if (!proxy.IsRunning()) LOG_WARN("https.proxy not running");
                 else { proxy.Stop(); LOG_SUCCESS("https.proxy stopped"); }
@@ -253,6 +271,11 @@ int main(int argc, char** argv) {
     if (want_dns) {
         if (dns_spoofer.Start()) {
             LOG_SUCCESS("dns.spoof started (redirecting resolved names to " + iface->ip + ")");
+            if (!arp_spoofer.IsRunning()) {
+                LOG_WARN("arp.spoof isn't running — on encrypted Wi-Fi you won't see any "
+                         "other device's traffic without it too (-t <ip> --arp, or "
+                         "arp.spoof on <ip> once running)");
+            }
         } else {
             LOG_ERROR("Failed to start DNS spoofing");
         }
@@ -287,6 +310,11 @@ int main(int argc, char** argv) {
     if (want_proxy) {
         if (proxy.Start()) {
             LOG_SUCCESS("https.proxy started on port " + std::to_string(PROXY_PORT));
+            if (!arp_spoofer.IsRunning()) {
+                LOG_WARN("arp.spoof isn't running — on encrypted Wi-Fi you won't see any "
+                         "other device's traffic without it too (-t <ip> --arp, or "
+                         "arp.spoof on <ip> once running)");
+            }
         } else {
             LOG_ERROR("Failed to start MITM proxy");
         }
