@@ -25,6 +25,7 @@
 #include <sstream>
 #include <algorithm>
 #include <cstring>
+#include <chrono>
 
 #if defined(__has_include)
 #  if __has_include(<pcap/pcap.h>)
@@ -289,40 +290,94 @@ std::string NetworkManager::ArpLookup(IPv4Address ip) {
 
 void NetworkManager::LoadOuiDatabase(const std::string& path) {
     if (oui_loaded_) return;
-    std::string filepath = path.empty() ? "oui.txt" : path;
-    std::ifstream file(filepath);
+
+    std::vector<std::string> candidates;
+    if (!path.empty()) {
+        candidates.push_back(path);
+    } else {
+        // oui.txt first (explicit local override), then whatever real
+        // vendor database this machine happens to already have installed
+        // — nmap's compact prefix list ships with nmap itself (almost
+        // always present on a pentest distro), Wireshark's manuf needs the
+        // Wireshark package specifically, and Debian's ieee-data package
+        // (a common transitive dependency of tools like arp-scan/ettercap)
+        // installs the raw IEEE registry. Any of these beats this file's
+        // own ~30-entry hardcoded fallback list by orders of magnitude.
+        candidates = {
+            "oui.txt",
+            "/usr/share/nmap/nmap-mac-prefixes",
+            "/usr/share/wireshark/manuf",
+            "/usr/local/share/wireshark/manuf",
+            "/etc/manuf",
+            "/usr/share/ieee-data/oui.txt",
+            "/var/lib/ieee-data/oui.txt",
+        };
+    }
+
+    std::ifstream file;
+    std::string used_path;
+    for (auto& candidate : candidates) {
+        file.open(candidate);
+        if (file.is_open()) { used_path = candidate; break; }
+        file.clear();
+    }
+
     if (!file.is_open()) {
-        LOG_WARN("OUI database not found at " + filepath + " - vendor lookup disabled");
+        oui_loaded_ = true;
+        LOG_WARN("No vendor database found (checked oui.txt, nmap-mac-prefixes, Wireshark's "
+                 "manuf, and ieee-data) - vendor names will fall back to a small built-in "
+                 "list. Run: sudo apt install -y wireshark-common (installs just the manuf "
+                 "database, no GUI needed) to get real vendor names.");
         return;
     }
 
     std::string line;
+    size_t loaded = 0;
     while (std::getline(file, line)) {
-        if (line.size() < 8) continue;
-        std::string hex_part = line.substr(0, 6);
+        if (line.empty() || line[0] == '#') continue;
+
+        // Formats seen in the wild: "00:00:0C\tCisco\tCisco Systems, Inc"
+        // (Wireshark manuf, colon-separated prefix, tab-separated names),
+        // "000000 XEROX CORPORATION" (nmap-mac-prefixes, space-separated),
+        // or "000000\tXerox" (plain hex prefix + tab). Either way, the
+        // prefix is whatever comes before the first tab/comma/space.
+        size_t field_end = line.find_first_of("\t, ");
+        if (field_end == std::string::npos) continue;
+        std::string prefix_field = line.substr(0, field_end);
+        std::string rest = line.substr(field_end + 1);
+
         std::string clean_hex;
-        for (char c : hex_part) {
-            if (isxdigit(c)) clean_hex += c;
+        for (char c : prefix_field) {
+            if (isxdigit(static_cast<unsigned char>(c))) clean_hex += c;
+            if (clean_hex.size() == 6) break;
         }
-        if (clean_hex.size() == 6) {
-            uint32_t oui = 0;
-            sscanf(clean_hex.c_str(), "%x", &oui);
-            size_t tab_pos = line.find('\t');
-            if (tab_pos != std::string::npos) {
-                size_t name_start = line.find_first_not_of("\t (hex)", tab_pos);
-                if (name_start != std::string::npos) {
-                    std::string vendor = line.substr(name_start);
-                    while (!vendor.empty() && (vendor.back() == '\r' || vendor.back() == '\n' || vendor.back() == ' '))
-                        vendor.pop_back();
-                    while (!vendor.empty() && vendor.front() == ' ')
-                        vendor.erase(0, 1);
-                    oui_db_[oui] = vendor;
-                }
-            }
-        }
+        if (clean_hex.size() != 6) continue; // not a 24-bit OUI prefix (e.g. has a /28 mask) — skip
+
+        uint32_t oui = 0;
+        sscanf(clean_hex.c_str(), "%x", &oui);
+
+        // Prefer the long-form vendor name (Wireshark's 2nd tab field)
+        // when present, otherwise use whatever's left on the line.
+        size_t tab2 = rest.find('\t');
+        std::string vendor = (tab2 != std::string::npos) ? rest.substr(tab2 + 1) : rest;
+
+        while (!vendor.empty() && (vendor.back() == '\r' || vendor.back() == '\n' || vendor.back() == ' '))
+            vendor.pop_back();
+        size_t start = vendor.find_first_not_of(' ');
+        vendor = (start == std::string::npos) ? "" : vendor.substr(start);
+        if (vendor.empty()) continue;
+
+        oui_db_[oui] = vendor;
+        loaded++;
     }
+
     oui_loaded_ = true;
-    LOG_INFO("Loaded " + std::to_string(oui_db_.size()) + " OUI entries");
+    if (loaded > 0) {
+        LOG_SUCCESS("Loaded " + std::to_string(loaded) + " vendor entries from " + used_path);
+    } else {
+        LOG_WARN("Vendor database at " + used_path + " had no parseable entries "
+                 "- vendor names will fall back to a small built-in list");
+    }
 }
 
 std::string NetworkManager::LookupVendor(const MacAddress& mac) {
@@ -357,6 +412,109 @@ std::string NetworkManager::LookupVendor(const MacAddress& mac) {
     if (short_oui == 0x9CB6 || short_oui == 0x5A73 || short_oui == 0x843A) return "Realtek";
 
     return "Unknown";
+}
+
+std::vector<std::pair<IPv4Address, MacAddress>> NetworkManager::ScanSubnet(
+        const std::string& interface_name, int timeout_ms) {
+    std::vector<std::pair<IPv4Address, MacAddress>> results;
+#if PHANTOM_HAS_PCAP
+    auto iface = FindInterface(interface_name);
+    if (!iface || iface->ip.empty() || iface->netmask.empty() || iface->mac.empty()) {
+        LOG_ERROR("Cannot scan subnet: interface has no usable IPv4 address");
+        return results;
+    }
+
+    unsigned int ip_o[4], mask_o[4];
+    if (sscanf(iface->ip.c_str(), "%u.%u.%u.%u", &ip_o[0], &ip_o[1], &ip_o[2], &ip_o[3]) != 4 ||
+        sscanf(iface->netmask.c_str(), "%u.%u.%u.%u", &mask_o[0], &mask_o[1], &mask_o[2], &mask_o[3]) != 4) {
+        return results;
+    }
+
+    uint32_t ip_val = (ip_o[0] << 24) | (ip_o[1] << 16) | (ip_o[2] << 8) | ip_o[3];
+    uint32_t mask_val = (mask_o[0] << 24) | (mask_o[1] << 16) | (mask_o[2] << 8) | mask_o[3];
+    uint32_t network_val = ip_val & mask_val;
+    uint32_t broadcast_val = network_val | ~mask_val;
+
+    if (broadcast_val <= network_val + 1 || (broadcast_val - network_val) > 4094) {
+        LOG_WARN("Subnet scan skipped: need a /20 network or smaller");
+        return results;
+    }
+
+    MacAddress local_mac = MacAddress::FromString(iface->mac);
+    IPv4Address local_ip = IPv4Address::FromString(iface->ip);
+
+    char errbuf[PCAP_ERRBUF_SIZE];
+    pcap_t* handle = pcap_open_live(interface_name.c_str(), 65535, 1, 50, errbuf);
+    if (!handle) {
+        LOG_ERROR("Failed to open interface for subnet scan: " + std::string(errbuf));
+        return results;
+    }
+
+    struct bpf_program filter;
+    if (pcap_compile(handle, &filter, "arp", 1, 0) == 0) {
+        pcap_setfilter(handle, &filter);
+        pcap_freecode(&filter);
+    }
+
+    for (uint32_t h = network_val + 1; h < broadcast_val; ++h) {
+        std::string target_ip_str =
+            std::to_string((h >> 24) & 0xFF) + "." + std::to_string((h >> 16) & 0xFF) + "." +
+            std::to_string((h >> 8) & 0xFF) + "." + std::to_string(h & 0xFF);
+        IPv4Address target_ip = IPv4Address::FromString(target_ip_str);
+        if (target_ip.addr == local_ip.addr) continue;
+
+        uint8_t packet[42] = {0};
+        memset(packet, 0xFF, 6);
+        memcpy(packet + 6, local_mac.bytes, 6);
+        packet[12] = 0x08; packet[13] = 0x06;
+        packet[14] = 0x00; packet[15] = 0x01;
+        packet[16] = 0x08; packet[17] = 0x00;
+        packet[18] = 0x06;
+        packet[19] = 0x04;
+        packet[20] = 0x00; packet[21] = 0x01;
+        memcpy(packet + 22, local_mac.bytes, 6);
+        memcpy(packet + 28, &local_ip.addr, 4);
+        memset(packet + 32, 0, 6);
+        memcpy(packet + 38, &target_ip.addr, 4);
+
+        pcap_sendpacket(handle, packet, sizeof(packet));
+    }
+
+    std::map<uint32_t, MacAddress> found;
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+
+    while (std::chrono::steady_clock::now() < deadline) {
+        struct pcap_pkthdr* header;
+        const uint8_t* data;
+        int rc = pcap_next_ex(handle, &header, &data);
+        if (rc <= 0) continue;
+        if (header->caplen < 42) continue;
+        if (data[12] != 0x08 || data[13] != 0x06) continue;
+        if (data[20] != 0x00 || data[21] != 0x02) continue; // ARP reply
+
+        uint32_t reply_ip;
+        memcpy(&reply_ip, data + 28, 4);
+        if (found.find(reply_ip) == found.end()) {
+            MacAddress mac{};
+            memcpy(mac.bytes, data + 22, 6);
+            found[reply_ip] = mac;
+        }
+    }
+
+    pcap_close(handle);
+
+    results.reserve(found.size());
+    for (auto& [ip_addr, mac] : found) {
+        IPv4Address ip{};
+        ip.addr = ip_addr;
+        results.emplace_back(ip, mac);
+    }
+#else
+    (void)interface_name;
+    (void)timeout_ms;
+    LOG_WARN("Subnet scan requested but libpcap is unavailable in this environment");
+#endif
+    return results;
 }
 
 } // namespace phantom

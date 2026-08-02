@@ -536,15 +536,20 @@ void MitmProxy::AcceptLoop() {
     socklen_t client_len = sizeof(client_addr);
 
     while (running_) {
+        // listen_sock_ is non-blocking, so gate accept() behind a timed
+        // select() instead of spinning: without this, an idle listener
+        // makes accept() return EWOULDBLOCK continuously, pegging this
+        // thread at 100% CPU and flooding the log with "Accept error".
+        fd_set accept_set;
+        FD_ZERO(&accept_set);
+        FD_SET(listen_sock_, &accept_set);
+        struct timeval accept_tv{0, 200000}; // 200ms
+        int ready = select((int)listen_sock_ + 1, &accept_set, nullptr, nullptr, &accept_tv);
+        if (ready <= 0) continue;
+
         socket_t client = accept(listen_sock_, (struct sockaddr*)&client_addr, &client_len);
         if (client == INVALID_SOCK) {
-            if (running_) {
-#ifdef _WIN32
-                if (WSAGetLastError() != WSAEWOULDBLOCK)
-#endif
-                LOG_DEBUG("Accept error");
-            }
-            continue;
+            continue; // spurious wakeup, nothing to log
         }
 
         SetNonBlocking(client);

@@ -61,7 +61,16 @@ public:
 
         std::cout << prefix << " " << time_buf << "."
                   << std::setfill('0') << std::setw(3) << ms.count()
+                  << std::setfill(' ')
                   << " " << message << std::endl;
+    }
+
+    // Writes pre-formatted, multi-line text to stdout under the same lock
+    // Log() uses, so a multi-statement block (e.g. a device table) can't get
+    // a log line spliced into the middle of it by a concurrent Log() call.
+    void WriteRaw(const std::string& text) {
+        std::lock_guard<std::mutex> lock(mtx_);
+        std::cout << text;
     }
 
     void LogActivity(const std::string& json_line) {
