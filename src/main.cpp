@@ -102,12 +102,24 @@ void CommandLoop(ArpSpoofer& arp_spoofer, DnsSpoofer& dns_spoofer, MitmProxy& pr
                     if (arp_spoofer.IsRunning()) arp_spoofer.Stop(); // joins before we touch targets_
                     IPv4Address tip = IPv4Address::FromString(arg);
                     MacAddress tmac = NetworkManager::GetMacForIp(iface_name, tip);
+                    // AddTarget still gets the target even if unresolved here —
+                    // ArpSpoofer::Start() retries resolution itself. But only
+                    // record it in the device table once we have a real MAC:
+                    // writing a 00:00:00:00:00:00 placeholder creates a
+                    // permanent ghost row for this IP that never gets cleaned
+                    // up, sitting alongside whatever real entry a scan finds.
                     arp_spoofer.AddTarget(tip, tmac);
-                    Session::Instance().UpdateDevice(tmac, [&](DeviceInfo& dev) {
-                        dev.ip = tip;
-                        dev.mac = tmac;
-                        dev.is_target = true;
-                    });
+                    if (!tmac.IsZero()) {
+                        Session::Instance().UpdateDevice(tmac, [&](DeviceInfo& dev) {
+                            dev.ip = tip;
+                            dev.mac = tmac;
+                            dev.is_target = true;
+                        });
+                        LOG_SUCCESS("Target " + tip.ToString() + " -> " + tmac.ToString());
+                    } else {
+                        LOG_WARN("Could not resolve a MAC for " + tip.ToString() +
+                                 " yet — will retry when arp.spoof starts");
+                    }
                 }
                 if (gateway_ip_str.empty()) {
                     LOG_ERROR("No gateway resolved, cannot start arp.spoof");
@@ -246,12 +258,19 @@ int main(int argc, char** argv) {
     for (auto& t : target_ips) {
         IPv4Address tip = IPv4Address::FromString(t);
         MacAddress tmac = NetworkManager::GetMacForIp(iface_name, tip);
+        // See the arp.spoof command handler for why this only touches the
+        // device table when resolution actually succeeded.
         arp_spoofer.AddTarget(tip, tmac);
-        Session::Instance().UpdateDevice(tmac, [&](DeviceInfo& dev) {
-            dev.ip = tip;
-            dev.mac = tmac;
-            dev.is_target = true;
-        });
+        if (!tmac.IsZero()) {
+            Session::Instance().UpdateDevice(tmac, [&](DeviceInfo& dev) {
+                dev.ip = tip;
+                dev.mac = tmac;
+                dev.is_target = true;
+            });
+        } else {
+            LOG_WARN("Could not resolve a MAC for " + tip.ToString() +
+                     " yet — will retry when arp.spoof starts");
+        }
     }
     if (want_arp) {
         if (target_ips.empty()) {
